@@ -1,5 +1,0 @@
-prune tests
-graft src/quick_algo/cpp
-include src/quick_algo/di_graph.pyi
-include src/quick_algo/pagerank.pyi
-include CHANGELOG.md
