@@ -1,8 +1,8 @@
 from src.tools.tool_can_use.base_tool import BaseTool
-from src.common.logger import get_module_logger
+from src.common.logger import get_logger
 from typing import Any
 
-logger = get_module_logger("compare_numbers_tool")
+logger = get_logger("compare_numbers_tool")
 
 
 class CompareNumbersTool(BaseTool):
@@ -28,10 +28,10 @@ class CompareNumbersTool(BaseTool):
         Returns:
             dict: 工具执行结果
         """
-        try:
-            num1 = function_args.get("num1")
-            num2 = function_args.get("num2")
+        num1: int | float = function_args.get("num1")  # type: ignore
+        num2: int | float = function_args.get("num2")  # type: ignore
 
+        try:
             if num1 > num2:
                 result = f"{num1} 大于 {num2}"
             elif num1 < num2:
@@ -39,11 +39,7 @@ class CompareNumbersTool(BaseTool):
             else:
                 result = f"{num1} 等于 {num2}"
 
-            return {"type": "comparison_result", "id": f"{num1}_vs_{num2}", "content": result}
+            return {"name": self.name, "content": result}
         except Exception as e:
             logger.error(f"比较数字失败: {str(e)}")
-            return {"type": "info", "id": f"{num1}_vs_{num2}", "content": f"比较数字失败，炸了: {str(e)}"}
-
-
-# 注册工具
-# register_tool(CompareNumbersTool)
+            return {"name": self.name, "content": f"比较数字失败，炸了: {str(e)}"}

@@ -5,20 +5,20 @@ import os
 import random
 import time
 import traceback
-from typing import Optional, Tuple, List, Any
-from PIL import Image
 import io
 import re
+import binascii
+from typing import Optional, Tuple, List, Any
+from PIL import Image
+from rich.traceback import install
 
-# from gradio_client import file
 
 from src.common.database.database_model import Emoji
 from src.common.database.database import db as peewee_db
+from src.common.logger import get_logger
 from src.config.config import global_config
-from src.chat.utils.utils_image import image_path_to_base64, image_manager
+from src.chat.utils.utils_image import image_path_to_base64, get_image_manager
 from src.llm_models.utils_model import LLMRequest
-from src.common.logger_manager import get_logger
-from rich.traceback import install
 
 install(extra_lines=3)
 
@@ -26,7 +26,7 @@ logger = get_logger("emoji")
 
 BASE_DIR = os.path.join("data")
 EMOJI_DIR = os.path.join(BASE_DIR, "emoji")  # 表情包存储目录
-EMOJI_REGISTED_DIR = os.path.join(BASE_DIR, "emoji_registed")  # 已注册的表情包注册目录
+EMOJI_REGISTERED_DIR = os.path.join(BASE_DIR, "emoji_registed")  # 已注册的表情包注册目录
 MAX_EMOJI_FOR_PROMPT = 20  # 最大允许的表情包描述数量于图片替换的 prompt 中
 
 """
@@ -47,7 +47,7 @@ class MaiEmoji:
         self.embedding = []
         self.hash = ""  # 初始为空，在创建实例时会计算
         self.description = ""
-        self.emotion = []
+        self.emotion: List[str] = []
         self.usage_count = 0
         self.last_used_time = time.time()
         self.register_time = time.time()
@@ -74,6 +74,9 @@ class MaiEmoji:
 
             # 计算哈希值
             logger.debug(f"[初始化] 正在解码Base64并计算哈希: {self.filename}")
+            # 确保base64字符串只包含ASCII字符
+            if isinstance(image_base64, str):
+                image_base64 = image_base64.encode("ascii", errors="ignore").decode("ascii")
             image_bytes = base64.b64decode(image_base64)
             self.hash = hashlib.md5(image_bytes).hexdigest()
             logger.debug(f"[初始化] 哈希计算成功: {self.hash}")
@@ -82,7 +85,7 @@ class MaiEmoji:
             logger.debug(f"[初始化] 正在使用Pillow获取格式: {self.filename}")
             try:
                 with Image.open(io.BytesIO(image_bytes)) as img:
-                    self.format = img.format.lower()
+                    self.format = img.format.lower()  # type: ignore
                 logger.debug(f"[初始化] 格式获取成功: {self.format}")
             except Exception as pil_error:
                 logger.error(f"[初始化错误] Pillow无法处理图片 ({self.filename}): {pil_error}")
@@ -97,7 +100,7 @@ class MaiEmoji:
             logger.error(f"[初始化错误] 文件在处理过程中丢失: {self.full_path}")
             self.is_deleted = True
             return None
-        except base64.binascii.Error as b64_error:
+        except (binascii.Error, ValueError) as b64_error:
             logger.error(f"[初始化错误] Base64解码失败 ({self.filename}): {b64_error}")
             self.is_deleted = True
             return None
@@ -110,7 +113,7 @@ class MaiEmoji:
     async def register_to_db(self) -> bool:
         """
         注册表情包
-        将表情包对应的文件，从当前路径移动到EMOJI_REGISTED_DIR目录下
+        将表情包对应的文件，从当前路径移动到EMOJI_REGISTERED_DIR目录下
         并修改对应的实例属性，然后将表情包信息保存到数据库中
         """
         try:
@@ -119,7 +122,7 @@ class MaiEmoji:
             # 源路径是当前实例的完整路径 self.full_path
             source_full_path = self.full_path
             # 目标完整路径
-            destination_full_path = os.path.join(EMOJI_REGISTED_DIR, self.filename)
+            destination_full_path = os.path.join(EMOJI_REGISTERED_DIR, self.filename)
 
             # 检查源文件是否存在
             if not os.path.exists(source_full_path):
@@ -136,7 +139,7 @@ class MaiEmoji:
                 logger.debug(f"[移动] 文件从 {source_full_path} 移动到 {destination_full_path}")
                 # 更新实例的路径属性为新路径
                 self.full_path = destination_full_path
-                self.path = EMOJI_REGISTED_DIR
+                self.path = EMOJI_REGISTERED_DIR
                 # self.filename 保持不变
             except Exception as move_error:
                 logger.error(f"[错误] 移动文件失败: {str(move_error)}")
@@ -163,7 +166,7 @@ class MaiEmoji:
                     last_used_time=self.last_used_time,
                 )
 
-                logger.success(f"[注册] 表情包信息保存到数据库: {self.filename} ({self.emotion})")
+                logger.info(f"[注册] 表情包信息保存到数据库: {self.filename} ({self.emotion})")
 
                 return True
 
@@ -199,7 +202,7 @@ class MaiEmoji:
             try:
                 will_delete_emoji = Emoji.get(Emoji.emoji_hash == self.hash)
                 result = will_delete_emoji.delete_instance()  # Returns the number of rows deleted.
-            except Emoji.DoesNotExist:
+            except Emoji.DoesNotExist:  # type: ignore
                 logger.warning(f"[删除] 数据库中未找到哈希值为 {self.hash} 的表情包记录。")
                 result = 0  # Indicate no DB record was deleted
 
@@ -295,21 +298,25 @@ def _to_emoji_objects(data: Any) -> Tuple[List["MaiEmoji"], int]:
 def _ensure_emoji_dir() -> None:
     """确保表情存储目录存在"""
     os.makedirs(EMOJI_DIR, exist_ok=True)
-    os.makedirs(EMOJI_REGISTED_DIR, exist_ok=True)
+    os.makedirs(EMOJI_REGISTERED_DIR, exist_ok=True)
 
 
 async def clear_temp_emoji() -> None:
     """清理临时表情包
-    清理/data/emoji和/data/image目录下的所有文件
+    清理/data/emoji、/data/image和/data/images目录下的所有文件
     当目录中文件数超过100时，会全部删除
     """
 
     logger.info("[清理] 开始清理缓存...")
 
-    for need_clear in (os.path.join(BASE_DIR, "emoji"), os.path.join(BASE_DIR, "image")):
+    for need_clear in (
+        os.path.join(BASE_DIR, "emoji"),
+        os.path.join(BASE_DIR, "image"),
+        os.path.join(BASE_DIR, "images"),
+    ):
         if os.path.exists(need_clear):
             files = os.listdir(need_clear)
-            # 如果文件数超过50就全部删除
+            # 如果文件数超过100就全部删除
             if len(files) > 100:
                 for filename in files:
                     file_path = os.path.join(need_clear, filename)
@@ -317,19 +324,17 @@ async def clear_temp_emoji() -> None:
                         os.remove(file_path)
                         logger.debug(f"[清理] 删除: {filename}")
 
-    logger.success("[清理] 完成")
 
-
-async def clean_unused_emojis(emoji_dir: str, emoji_objects: List["MaiEmoji"]) -> None:
+async def clean_unused_emojis(emoji_dir: str, emoji_objects: List["MaiEmoji"], removed_count: int) -> int:
     """清理指定目录中未被 emoji_objects 追踪的表情包文件"""
     if not os.path.exists(emoji_dir):
         logger.warning(f"[清理] 目标目录不存在，跳过清理: {emoji_dir}")
-        return
+        return removed_count
 
+    cleaned_count = 0
     try:
         # 获取内存中所有有效表情包的完整路径集合
         tracked_full_paths = {emoji.full_path for emoji in emoji_objects if not emoji.is_deleted}
-        cleaned_count = 0
 
         # 遍历指定目录中的所有文件
         for file_name in os.listdir(emoji_dir):
@@ -349,12 +354,14 @@ async def clean_unused_emojis(emoji_dir: str, emoji_objects: List["MaiEmoji"]) -
                     logger.error(f"[错误] 删除文件时出错 ({file_full_path}): {str(e)}")
 
         if cleaned_count > 0:
-            logger.success(f"[清理] 在目录 {emoji_dir} 中清理了 {cleaned_count} 个破损表情包。")
+            logger.info(f"[清理] 在目录 {emoji_dir} 中清理了 {cleaned_count} 个破损表情包。")
         else:
             logger.info(f"[清理] 目录 {emoji_dir} 中没有需要清理的。")
 
     except Exception as e:
         logger.error(f"[错误] 清理未使用表情包文件时出错 ({emoji_dir}): {str(e)}")
+
+    return removed_count + cleaned_count
 
 
 class EmojiManager:
@@ -407,12 +414,12 @@ class EmojiManager:
             emoji_update.usage_count += 1
             emoji_update.last_used_time = time.time()  # Update last used time
             emoji_update.save()  # Persist changes to DB
-        except Emoji.DoesNotExist:
+        except Emoji.DoesNotExist:  # type: ignore
             logger.error(f"记录表情使用失败: 未找到 hash 为 {emoji_hash} 的表情包")
         except Exception as e:
             logger.error(f"记录表情使用失败: {str(e)}")
 
-    async def get_emoji_for_text(self, text_emotion: str) -> Optional[Tuple[str, str]]:
+    async def get_emoji_for_text(self, text_emotion: str) -> Optional[Tuple[str, str, str]]:
         """根据文本内容获取相关表情包
         Args:
             text_emotion: 输入的情感描述文本
@@ -478,7 +485,7 @@ class EmojiManager:
                 f"为[{text_emotion}]找到表情包: {matched_emotion} ({selected_emoji.filename}), Similarity: {similarity:.4f}"
             )
             # 返回完整文件路径和描述
-            return selected_emoji.full_path, f"[ {selected_emoji.description} ]"
+            return selected_emoji.full_path, f"[ {selected_emoji.description} ]", matched_emotion
 
         except Exception as e:
             logger.error(f"[错误] 获取表情包失败: {str(e)}")
@@ -518,9 +525,9 @@ class EmojiManager:
         如果文件已被删除，则执行对象的删除方法并从列表中移除
         """
         try:
-            if not self.emoji_objects:
-                logger.warning("[检查] emoji_objects为空，跳过完整性检查")
-                return
+            # if not self.emoji_objects:
+            #     logger.warning("[检查] emoji_objects为空，跳过完整性检查")
+            #     return
 
             total_count = len(self.emoji_objects)
             self.emoji_num = total_count
@@ -563,12 +570,12 @@ class EmojiManager:
             if objects_to_remove:
                 self.emoji_objects = [e for e in self.emoji_objects if e not in objects_to_remove]
 
-            # 清理 EMOJI_REGISTED_DIR 目录中未被追踪的文件
-            await clean_unused_emojis(EMOJI_REGISTED_DIR, self.emoji_objects)
+            # 清理 EMOJI_REGISTERED_DIR 目录中未被追踪的文件
+            removed_count = await clean_unused_emojis(EMOJI_REGISTERED_DIR, self.emoji_objects, removed_count)
 
             # 输出清理结果
             if removed_count > 0:
-                logger.success(f"[清理] 已清理 {removed_count} 个失效/文件丢失的表情包记录")
+                logger.info(f"[清理] 已清理 {removed_count} 个失效/文件丢失的表情包记录")
                 logger.info(f"[统计] 清理前记录数: {total_count} | 清理后有效记录数: {len(self.emoji_objects)}")
             else:
                 logger.info(f"[检查] 已检查 {total_count} 个表情包记录，全部完好")
@@ -581,7 +588,7 @@ class EmojiManager:
         """定期检查表情包完整性和数量"""
         await self.get_all_emoji_from_db()
         while True:
-            logger.info("[扫描] 开始检查表情包完整性...")
+            # logger.info("[扫描] 开始检查表情包完整性...")
             await self.check_emoji_file_integrity()
             await clear_temp_emoji()
             logger.info("[扫描] 开始扫描新表情包...")
@@ -602,8 +609,9 @@ class EmojiManager:
                 continue
 
             # 检查是否需要处理表情包(数量超过最大值或不足)
-            if (self.emoji_num > self.emoji_num_max and global_config.emoji.do_replace) or (
-                self.emoji_num < self.emoji_num_max
+            if global_config.emoji.steal_emoji and (
+                (self.emoji_num > self.emoji_num_max and global_config.emoji.do_replace)
+                or (self.emoji_num < self.emoji_num_max)
             ):
                 try:
                     # 获取目录下所有图片文件
@@ -644,7 +652,7 @@ class EmojiManager:
             self.emoji_objects = emoji_objects
             self.emoji_num = len(emoji_objects)
 
-            logger.success(f"[数据库] 加载完成: 共加载 {self.emoji_num} 个表情包记录。")
+            logger.info(f"[数据库] 加载完成: 共加载 {self.emoji_num} 个表情包记录。")
             if load_errors > 0:
                 logger.warning(f"[数据库] 加载过程中出现 {load_errors} 个错误。")
 
@@ -698,6 +706,38 @@ class EmojiManager:
             if not emoji.is_deleted and emoji.hash == emoji_hash:
                 return emoji
         return None  # 如果循环结束还没找到，则返回 None
+
+    async def get_emoji_description_by_hash(self, emoji_hash: str) -> Optional[str]:
+        """根据哈希值获取已注册表情包的描述
+        
+        Args:
+            emoji_hash: 表情包的哈希值
+            
+        Returns:
+            Optional[str]: 表情包描述，如果未找到则返回None
+        """
+        try:
+            # 先从内存中查找
+            emoji = await self.get_emoji_from_manager(emoji_hash)
+            if emoji and emoji.description:
+                logger.info(f"[缓存命中] 从内存获取表情包描述: {emoji.description[:50]}...")
+                return emoji.description
+            
+            # 如果内存中没有，从数据库查找
+            self._ensure_db()
+            try:
+                emoji_record = Emoji.get_or_none(Emoji.emoji_hash == emoji_hash)
+                if emoji_record and emoji_record.description:
+                    logger.info(f"[缓存命中] 从数据库获取表情包描述: {emoji_record.description[:50]}...")
+                    return emoji_record.description
+            except Exception as e:
+                logger.error(f"从数据库查询表情包描述时出错: {e}")
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"获取表情包描述失败 (Hash: {emoji_hash}): {str(e)}")
+            return None
 
     async def delete_emoji(self, emoji_hash: str) -> bool:
         """根据哈希值删除表情包
@@ -807,7 +847,7 @@ class EmojiManager:
                         if register_success:
                             self.emoji_objects.append(new_emoji)
                             self.emoji_num += 1
-                            logger.success(f"[成功] 注册: {new_emoji.filename}")
+                            logger.info(f"[成功] 注册: {new_emoji.filename}")
                             return True
                         else:
                             logger.error(f"[错误] 注册表情包到数据库失败: {new_emoji.filename}")
@@ -828,7 +868,7 @@ class EmojiManager:
             return False
 
     async def build_emoji_description(self, image_base64: str) -> Tuple[str, List[str]]:
-        """获取表情包描述和情感列表
+        """获取表情包描述和情感列表，优化复用已有描述
 
         Args:
             image_base64: 图片的base64编码
@@ -838,17 +878,39 @@ class EmojiManager:
         """
         try:
             # 解码图片并获取格式
+            # 确保base64字符串只包含ASCII字符
+            if isinstance(image_base64, str):
+                image_base64 = image_base64.encode("ascii", errors="ignore").decode("ascii")
             image_bytes = base64.b64decode(image_base64)
-            image_format = Image.open(io.BytesIO(image_bytes)).format.lower()
+            image_hash = hashlib.md5(image_bytes).hexdigest()
+            image_format = Image.open(io.BytesIO(image_bytes)).format.lower()  # type: ignore
 
-            # 调用AI获取描述
-            if image_format == "gif" or image_format == "GIF":
-                image_base64 = image_manager.transform_gif(image_base64)
-                prompt = "这是一个动态图表情包，每一张图代表了动态图的某一帧，黑色背景代表透明，描述一下表情包表达的情感和内容，描述细节，从互联网梗,meme的角度去分析"
-                description, _ = await self.vlm.generate_response_for_image(prompt, image_base64, "jpg")
+            # 尝试从Images表获取已有的详细描述（可能在收到表情包时已生成）
+            existing_description = None
+            try:
+                from src.common.database.database_model import Images
+                existing_image = Images.get_or_none((Images.emoji_hash == image_hash) & (Images.type == "emoji"))
+                if existing_image and existing_image.description:
+                    existing_description = existing_image.description
+                    logger.info(f"[复用描述] 找到已有详细描述: {existing_description[:50]}...")
+            except Exception as e:
+                logger.debug(f"查询已有描述时出错: {e}")
+
+            # 第一步：VLM视觉分析（如果没有已有描述才调用）
+            if existing_description:
+                description = existing_description
+                logger.info("[优化] 复用已有的详细描述，跳过VLM调用")
             else:
-                prompt = "这是一个表情包，请详细描述一下表情包所表达的情感和内容，描述细节，从互联网梗,meme的角度去分析"
-                description, _ = await self.vlm.generate_response_for_image(prompt, image_base64, image_format)
+                logger.info("[VLM分析] 生成新的详细描述")
+                if image_format == "gif" or image_format == "GIF":
+                    image_base64 = get_image_manager().transform_gif(image_base64)  # type: ignore
+                    if not image_base64:
+                        raise RuntimeError("GIF表情包转换失败")
+                    prompt = "这是一个动态图表情包，每一张图代表了动态图的某一帧，黑色背景代表透明，描述一下表情包表达的情感和内容，描述细节，从互联网梗,meme的角度去分析"
+                    description, _ = await self.vlm.generate_response_for_image(prompt, image_base64, "jpg")
+                else:
+                    prompt = "这是一个表情包，请详细描述一下表情包所表达的情感和内容，描述细节，从互联网梗,meme的角度去分析"
+                    description, _ = await self.vlm.generate_response_for_image(prompt, image_base64, image_format)
 
             # 审核表情包
             if global_config.emoji.content_filtration:
@@ -864,7 +926,7 @@ class EmojiManager:
                 if content == "否":
                     return "", []
 
-            # 分析情感含义
+            # 第二步：LLM情感分析 - 基于详细描述生成情感标签列表
             emotion_prompt = f"""
             请你识别这个表情包的含义和适用场景，给我简短的描述，每个描述不要超过15个字
             这是一个基于这个表情包的描述：'{description}'
@@ -876,11 +938,13 @@ class EmojiManager:
             # 处理情感列表
             emotions = [e.strip() for e in emotions_text.split(",") if e.strip()]
 
-            # 根据情感标签数量随机选择喵~超过5个选3个，超过2个选2个
+            # 根据情感标签数量随机选择 - 超过5个选3个，超过2个选2个
             if len(emotions) > 5:
                 emotions = random.sample(emotions, 3)
             elif len(emotions) > 2:
                 emotions = random.sample(emotions, 2)
+
+            logger.info(f"[注册分析] 详细描述: {description[:50]}... -> 情感标签: {emotions}")
 
             return f"[表情包：{description}]", emotions
 
@@ -972,7 +1036,7 @@ class EmojiManager:
                     # 注册成功后，添加到内存列表
                     self.emoji_objects.append(new_emoji)
                     self.emoji_num += 1
-                    logger.success(f"[成功] 注册新表情包: {filename} (当前: {self.emoji_num}/{self.emoji_num_max})")
+                    logger.info(f"[成功] 注册新表情包: {filename} (当前: {self.emoji_num}/{self.emoji_num_max})")
                     return True
                 else:
                     logger.error(f"[注册失败] 保存表情包到数据库/移动文件失败: {filename}")
@@ -999,5 +1063,11 @@ class EmojiManager:
             return False
 
 
-# 创建全局单例
-emoji_manager = EmojiManager()
+emoji_manager = None
+
+
+def get_emoji_manager():
+    global emoji_manager
+    if emoji_manager is None:
+        emoji_manager = EmojiManager()
+    return emoji_manager

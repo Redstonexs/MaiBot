@@ -1,7 +1,8 @@
+import asyncio
+
 from time import perf_counter
 from functools import wraps
 from typing import Optional, Dict, Callable
-import asyncio
 from rich.traceback import install
 
 install(extra_lines=3)
@@ -88,10 +89,10 @@ class Timer:
 
         self.name = name
         self.storage = storage
-        self.elapsed = None
+        self.elapsed: float = None  # type: ignore
 
         self.auto_unit = auto_unit
-        self.start = None
+        self.start: float = None  # type: ignore
 
     @staticmethod
     def _validate_types(name, storage):
@@ -111,14 +112,16 @@ class Timer:
         async def async_wrapper(*args, **kwargs):
             with self:
                 return await func(*args, **kwargs)
+            return None
 
         @wraps(func)
         def sync_wrapper(*args, **kwargs):
             with self:
                 return func(*args, **kwargs)
+            return None
 
         wrapper = async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
-        wrapper.__timer__ = self  # 保留计时器引用
+        wrapper.__timer__ = self  # 保留计时器引用 # type: ignore
         return wrapper
 
     def __enter__(self):

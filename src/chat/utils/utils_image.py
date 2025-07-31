@@ -2,19 +2,20 @@ import base64
 import os
 import time
 import hashlib
-from typing import Optional
-from PIL import Image
+import uuid
 import io
+import asyncio
 import numpy as np
 
+from typing import Optional, Tuple
+from PIL import Image
+from rich.traceback import install
 
+from src.common.logger import get_logger
 from src.common.database.database import db
 from src.common.database.database_model import Images, ImageDescriptions
 from src.config.config import global_config
 from src.llm_models.utils_model import LLMRequest
-
-from src.common.logger_manager import get_logger
-from rich.traceback import install
 
 install(extra_lines=3)
 
@@ -36,7 +37,7 @@ class ImageManager:
             self._ensure_image_dir()
 
             self._initialized = True
-            self._llm = LLMRequest(model=global_config.model.vlm, temperature=0.4, max_tokens=300, request_type="image")
+            self.vlm = LLMRequest(model=global_config.model.vlm, temperature=0.4, max_tokens=300, request_type="image")
 
             try:
                 db.connect(reuse_if_open=True)
@@ -93,157 +94,220 @@ class ImageManager:
             logger.error(f"保存描述到数据库失败 (Peewee): {str(e)}")
 
     async def get_emoji_description(self, image_base64: str) -> str:
-        """获取表情包描述，带查重和保存功能"""
+        """获取表情包描述，优先使用Emoji表中的缓存数据"""
         try:
             # 计算图片哈希
+            # 确保base64字符串只包含ASCII字符
+            if isinstance(image_base64, str):
+                image_base64 = image_base64.encode("ascii", errors="ignore").decode("ascii")
             image_bytes = base64.b64decode(image_base64)
             image_hash = hashlib.md5(image_bytes).hexdigest()
-            image_format = Image.open(io.BytesIO(image_bytes)).format.lower()
+            image_format = Image.open(io.BytesIO(image_bytes)).format.lower()  # type: ignore
 
-            # 查询缓存的描述
+            # 优先使用EmojiManager查询已注册表情包的描述
+            try:
+                from src.chat.emoji_system.emoji_manager import get_emoji_manager
+                emoji_manager = get_emoji_manager()
+                cached_emoji_description = await emoji_manager.get_emoji_description_by_hash(image_hash)
+                if cached_emoji_description:
+                    logger.info(f"[缓存命中] 使用已注册表情包描述: {cached_emoji_description[:50]}...")
+                    return cached_emoji_description
+            except Exception as e:
+                logger.debug(f"查询EmojiManager时出错: {e}")
+
+            # 查询ImageDescriptions表的缓存描述
             cached_description = self._get_description_from_db(image_hash, "emoji")
             if cached_description:
-                return f"[表情包，含义看起来是：{cached_description}]"
+                logger.info(f"[缓存命中] 使用ImageDescriptions表中的描述: {cached_description[:50]}...")
+                return f"[表情包：{cached_description}]"
 
-            # 调用AI获取描述
-            if image_format == "gif" or image_format == "GIF":
+            # === 二步走识别流程 ===
+            
+            # 第一步：VLM视觉分析 - 生成详细描述
+            if image_format in ["gif", "GIF"]:
                 image_base64_processed = self.transform_gif(image_base64)
                 if image_base64_processed is None:
                     logger.warning("GIF转换失败，无法获取描述")
                     return "[表情包(GIF处理失败)]"
-                prompt = "这是一个动态图表情包，每一张图代表了动态图的某一帧，黑色背景代表透明，使用1-2个词描述一下表情包表达的情感和内容，简短一些"
-                description, _ = await self._llm.generate_response_for_image(prompt, image_base64_processed, "jpg")
+                vlm_prompt = "这是一个动态图表情包，每一张图代表了动态图的某一帧，黑色背景代表透明，描述一下表情包表达的情感和内容，描述细节，从互联网梗,meme的角度去分析"
+                detailed_description, _ = await self.vlm.generate_response_for_image(vlm_prompt, image_base64_processed, "jpg")
             else:
-                prompt = "这是一个表情包，请用使用几个词描述一下表情包所表达的情感和内容，简短一些"
-                description, _ = await self._llm.generate_response_for_image(prompt, image_base64, image_format)
+                vlm_prompt = "这是一个表情包，请详细描述一下表情包所表达的情感和内容，描述细节，从互联网梗,meme的角度去分析"
+                detailed_description, _ = await self.vlm.generate_response_for_image(vlm_prompt, image_base64, image_format)
 
-            if description is None:
-                logger.warning("AI未能生成表情包描述")
-                return "[表情包(描述生成失败)]"
+            if detailed_description is None:
+                logger.warning("VLM未能生成表情包详细描述")
+                return "[表情包(VLM描述生成失败)]"
+
+            # 第二步：LLM情感分析 - 基于详细描述生成简短的情感标签
+            emotion_prompt = f"""
+            请你基于这个表情包的详细描述，提取出最核心的情感含义，用1-2个词概括。
+            详细描述：'{detailed_description}'
+            
+            要求：
+            1. 只输出1-2个最核心的情感词汇
+            2. 从互联网梗、meme的角度理解
+            3. 输出简短精准，不要解释
+            4. 如果有多个词用逗号分隔
+            """
+            
+            # 使用较低温度确保输出稳定
+            emotion_llm = LLMRequest(model=global_config.model.utils, temperature=0.3, max_tokens=50, request_type="emoji")
+            emotion_result, _ = await emotion_llm.generate_response_async(emotion_prompt)
+
+            if emotion_result is None:
+                logger.warning("LLM未能生成情感标签，使用详细描述的前几个词")
+                # 降级处理：从详细描述中提取关键词
+                import jieba
+                words = list(jieba.cut(detailed_description))
+                emotion_result = "，".join(words[:2]) if len(words) >= 2 else (words[0] if words else "表情")
+
+            # 处理情感结果，取前1-2个最重要的标签
+            emotions = [e.strip() for e in emotion_result.replace("，", ",").split(",") if e.strip()]
+            final_emotion = emotions[0] if emotions else "表情"
+            
+            # 如果有第二个情感且不重复，也包含进来
+            if len(emotions) > 1 and emotions[1] != emotions[0]:
+                final_emotion = f"{emotions[0]}，{emotions[1]}"
+
+            logger.info(f"[emoji识别] 详细描述: {detailed_description[:50]}... -> 情感标签: {final_emotion}")
 
             # 再次检查缓存，防止并发写入时重复生成
             cached_description = self._get_description_from_db(image_hash, "emoji")
             if cached_description:
                 logger.warning(f"虽然生成了描述，但是找到缓存表情包描述: {cached_description}")
-                return f"[表情包，含义看起来是：{cached_description}]"
+                return f"[表情包：{cached_description}]"
 
-            # 根据配置决定是否保存图片
-            if global_config.emoji.save_emoji:
-                # 生成文件名和路径
-                logger.debug(f"保存表情包: {image_hash}")
-                current_timestamp = time.time()
-                filename = f"{int(current_timestamp)}_{image_hash[:8]}.{image_format}"
-                emoji_dir = os.path.join(self.IMAGE_DIR, "emoji")
-                os.makedirs(emoji_dir, exist_ok=True)
-                file_path = os.path.join(emoji_dir, filename)
+            # 保存表情包文件和元数据（用于可能的后续分析）
+            logger.debug(f"保存表情包: {image_hash}")
+            current_timestamp = time.time()
+            filename = f"{int(current_timestamp)}_{image_hash[:8]}.{image_format}"
+            emoji_dir = os.path.join(self.IMAGE_DIR, "emoji")
+            os.makedirs(emoji_dir, exist_ok=True)
+            file_path = os.path.join(emoji_dir, filename)
 
+            try:
+                # 保存文件
+                with open(file_path, "wb") as f:
+                    f.write(image_bytes)
+
+                # 保存到数据库 (Images表) - 包含详细描述用于可能的注册流程
                 try:
-                    # 保存文件
-                    with open(file_path, "wb") as f:
-                        f.write(image_bytes)
+                    img_obj = Images.get((Images.emoji_hash == image_hash) & (Images.type == "emoji"))
+                    img_obj.path = file_path
+                    img_obj.description = detailed_description  # 保存详细描述
+                    img_obj.timestamp = current_timestamp
+                    img_obj.save()
+                except Images.DoesNotExist:  # type: ignore
+                    Images.create(
+                        emoji_hash=image_hash,
+                        path=file_path,
+                        type="emoji",
+                        description=detailed_description,  # 保存详细描述
+                        timestamp=current_timestamp,
+                    )
+            except Exception as e:
+                logger.error(f"保存表情包文件或元数据失败: {str(e)}")
 
-                    # 保存到数据库 (Images表)
-                    try:
-                        img_obj = Images.get((Images.emoji_hash == image_hash) & (Images.type == "emoji"))
-                        img_obj.path = file_path
-                        img_obj.description = description
-                        img_obj.timestamp = current_timestamp
-                        img_obj.save()
-                    except Images.DoesNotExist:
-                        Images.create(
-                            emoji_hash=image_hash,
-                            path=file_path,
-                            type="emoji",
-                            description=description,
-                            timestamp=current_timestamp,
-                        )
-                    # logger.debug(f"保存表情包元数据: {file_path}")
-                except Exception as e:
-                    logger.error(f"保存表情包文件或元数据失败: {str(e)}")
+            # 保存最终的情感标签到缓存 (ImageDescriptions表)
+            self._save_description_to_db(image_hash, final_emotion, "emoji")
 
-            # 保存描述到数据库 (ImageDescriptions表)
-            self._save_description_to_db(image_hash, description, "emoji")
+            return f"[表情包：{final_emotion}]"
 
-            return f"[表情包：{description}]"
         except Exception as e:
             logger.error(f"获取表情包描述失败: {str(e)}")
-            return "[表情包]"
+            return "[表情包(处理失败)]"
 
     async def get_image_description(self, image_base64: str) -> str:
-        """获取普通图片描述，带查重和保存功能"""
+        """获取普通图片描述，优先使用Images表中的缓存数据"""
         try:
             # 计算图片哈希
+            if isinstance(image_base64, str):
+                image_base64 = image_base64.encode("ascii", errors="ignore").decode("ascii")
             image_bytes = base64.b64decode(image_base64)
             image_hash = hashlib.md5(image_bytes).hexdigest()
-            image_format = Image.open(io.BytesIO(image_bytes)).format.lower()
 
-            # 查询缓存的描述
+            # 优先检查Images表中是否已有完整的描述
+            existing_image = Images.get_or_none(Images.emoji_hash == image_hash)
+            if existing_image:
+                # 更新计数
+                if hasattr(existing_image, "count") and existing_image.count is not None:
+                    existing_image.count += 1
+                else:
+                    existing_image.count = 1
+                existing_image.save()
+
+                # 如果已有描述，直接返回
+                if existing_image.description:
+                    logger.debug(f"[缓存命中] 使用Images表中的图片描述: {existing_image.description[:50]}...")
+                    return f"[图片：{existing_image.description}]"
+
+            # 查询ImageDescriptions表的缓存描述
             cached_description = self._get_description_from_db(image_hash, "image")
             if cached_description:
-                logger.debug(f"图片描述缓存中 {cached_description}")
+                logger.debug(f"[缓存命中] 使用ImageDescriptions表中的描述: {cached_description[:50]}...")
                 return f"[图片：{cached_description}]"
 
             # 调用AI获取描述
-            prompt = (
-                "请用中文描述这张图片的内容。如果有文字，请把文字都描述出来。并尝试猜测这个图片的含义。最多100个字。"
-            )
-            description, _ = await self._llm.generate_response_for_image(prompt, image_base64, image_format)
+            image_format = Image.open(io.BytesIO(image_bytes)).format.lower()  # type: ignore
+            prompt = global_config.custom_prompt.image_prompt
+            logger.info(f"[VLM调用] 为图片生成新描述 (Hash: {image_hash[:8]}...)")
+            description, _ = await self.vlm.generate_response_for_image(prompt, image_base64, image_format)
 
             if description is None:
                 logger.warning("AI未能生成图片描述")
                 return "[图片(描述生成失败)]"
 
-            # 再次检查缓存
-            cached_description = self._get_description_from_db(image_hash, "image")
-            if cached_description:
-                logger.warning(f"虽然生成了描述，但是找到缓存图片描述 {cached_description}")
-                return f"[图片：{cached_description}]"
+            # 保存图片和描述
+            current_timestamp = time.time()
+            filename = f"{int(current_timestamp)}_{image_hash[:8]}.{image_format}"
+            image_dir = os.path.join(self.IMAGE_DIR, "image")
+            os.makedirs(image_dir, exist_ok=True)
+            file_path = os.path.join(image_dir, filename)
 
-            logger.debug(f"描述是{description}")
+            try:
+                # 保存文件
+                with open(file_path, "wb") as f:
+                    f.write(image_bytes)
 
-            # 根据配置决定是否保存图片
-            if global_config.emoji.save_pic:
-                # 生成文件名和路径
-                current_timestamp = time.time()
-                filename = f"{int(current_timestamp)}_{image_hash[:8]}.{image_format}"
-                image_dir = os.path.join(self.IMAGE_DIR, "image")
-                os.makedirs(image_dir, exist_ok=True)
-                file_path = os.path.join(image_dir, filename)
+                # 保存到数据库，补充缺失字段
+                if existing_image:
+                    existing_image.path = file_path
+                    existing_image.description = description
+                    existing_image.timestamp = current_timestamp
+                    if not hasattr(existing_image, "image_id") or not existing_image.image_id:
+                        existing_image.image_id = str(uuid.uuid4())
+                    if not hasattr(existing_image, "vlm_processed") or existing_image.vlm_processed is None:
+                        existing_image.vlm_processed = True
+                    existing_image.save()
+                    logger.debug(f"[数据库] 更新已有图片记录: {image_hash[:8]}...")
+                else:
+                    Images.create(
+                        image_id=str(uuid.uuid4()),
+                        emoji_hash=image_hash,
+                        path=file_path,
+                        type="image",
+                        description=description,
+                        timestamp=current_timestamp,
+                        vlm_processed=True,
+                        count=1,
+                    )
+                    logger.debug(f"[数据库] 创建新图片记录: {image_hash[:8]}...")
+            except Exception as e:
+                logger.error(f"保存图片文件或元数据失败: {str(e)}")
 
-                try:
-                    # 保存文件
-                    with open(file_path, "wb") as f:
-                        f.write(image_bytes)
-
-                    # 保存到数据库 (Images表)
-                    try:
-                        img_obj = Images.get((Images.emoji_hash == image_hash) & (Images.type == "image"))
-                        img_obj.path = file_path
-                        img_obj.description = description
-                        img_obj.timestamp = current_timestamp
-                        img_obj.save()
-                    except Images.DoesNotExist:
-                        Images.create(
-                            emoji_hash=image_hash,
-                            path=file_path,
-                            type="image",
-                            description=description,
-                            timestamp=current_timestamp,
-                        )
-                    logger.trace(f"保存图片元数据: {file_path}")
-                except Exception as e:
-                    logger.error(f"保存图片文件或元数据失败: {str(e)}")
-
-            # 保存描述到数据库 (ImageDescriptions表)
+            # 保存描述到ImageDescriptions表作为备用缓存
             self._save_description_to_db(image_hash, description, "image")
 
+            logger.info(f"[VLM完成] 图片描述生成: {description[:50]}...")
             return f"[图片：{description}]"
         except Exception as e:
             logger.error(f"获取图片描述失败: {str(e)}")
-            return "[图片]"
+            return "[图片(处理失败)]"
 
     @staticmethod
     def transform_gif(gif_base64: str, similarity_threshold: float = 1000.0, max_frames: int = 15) -> Optional[str]:
+        # sourcery skip: use-contextlib-suppress
         """将GIF转换为水平拼接的静态图像, 跳过相似的帧
 
         Args:
@@ -255,6 +319,9 @@ class ImageManager:
             Optional[str]: 拼接后的JPG图像的base64编码字符串, 或者在失败时返回None
         """
         try:
+            # 确保base64字符串只包含ASCII字符
+            if isinstance(gif_base64, str):
+                gif_base64 = gif_base64.encode("ascii", errors="ignore").decode("ascii")
             # 解码base64
             gif_data = base64.b64decode(gif_base64)
             gif = Image.open(io.BytesIO(gif_data))
@@ -290,7 +357,7 @@ class ImageManager:
                 # 计算和上一张选中帧的差异（均方误差 MSE）
                 if last_selected_frame_np is not None:
                     mse = np.mean((current_frame_np - last_selected_frame_np) ** 2)
-                    # logger.trace(f"帧 {i} 与上一选中帧的 MSE: {mse}") # 可以取消注释来看差异值
+                    # logger.debug(f"帧 {i} 与上一选中帧的 MSE: {mse}") # 可以取消注释来看差异值
 
                     # 如果差异够大，就选它！
                     if mse > similarity_threshold:
@@ -334,7 +401,7 @@ class ImageManager:
             # 创建拼接图像
             total_width = target_width * len(resized_frames)
             # 防止总宽度为0
-            if total_width == 0 and len(resized_frames) > 0:
+            if total_width == 0 and resized_frames:
                 logger.warning("计算出的总宽度为0，但有选中帧，可能目标宽度太小")
                 # 至少给点宽度吧
                 total_width = len(resized_frames)
@@ -351,10 +418,7 @@ class ImageManager:
             # 转换为base64
             buffer = io.BytesIO()
             combined_image.save(buffer, format="JPEG", quality=85)  # 保存为JPEG
-            result_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-            return result_base64
-
+            return base64.b64encode(buffer.getvalue()).decode("utf-8")
         except MemoryError:
             logger.error("GIF转换失败: 内存不足，可能是GIF太大或帧数太多")
             return None  # 内存不够啦
@@ -362,9 +426,170 @@ class ImageManager:
             logger.error(f"GIF转换失败: {str(e)}", exc_info=True)  # 记录详细错误信息
             return None  # 其他错误也返回None
 
+    async def process_image(self, image_base64: str) -> Tuple[str, str]:
+        # sourcery skip: hoist-if-from-if
+        """处理图片并返回图片ID和描述
+
+        Args:
+            image_base64: 图片的base64编码
+
+        Returns:
+            Tuple[str, str]: (图片ID, 描述)
+        """
+        try:
+            # 生成图片ID
+            # 计算图片哈希
+            # 确保base64字符串只包含ASCII字符
+            if isinstance(image_base64, str):
+                image_base64 = image_base64.encode("ascii", errors="ignore").decode("ascii")
+            image_bytes = base64.b64decode(image_base64)
+            image_hash = hashlib.md5(image_bytes).hexdigest()
+
+            # 检查图片是否已存在
+            existing_image = Images.get_or_none(Images.emoji_hash == image_hash)
+
+            if existing_image:
+                # 检查是否缺少必要字段，如果缺少则创建新记录
+                if (
+                    not hasattr(existing_image, "image_id")
+                    or not existing_image.image_id
+                    or not hasattr(existing_image, "count")
+                    or existing_image.count is None
+                    or not hasattr(existing_image, "vlm_processed")
+                    or existing_image.vlm_processed is None
+                ):
+                    logger.debug(f"图片记录缺少必要字段，补全旧记录: {image_hash}")
+                    if not existing_image.image_id:
+                        existing_image.image_id = str(uuid.uuid4())
+                    if existing_image.count is None:
+                        existing_image.count = 0
+                    if existing_image.vlm_processed is None:
+                        existing_image.vlm_processed = False
+
+                existing_image.count += 1
+                existing_image.save()
+                return existing_image.image_id, f"[picid:{existing_image.image_id}]"
+            else:
+                # print(f"图片不存在: {image_hash}")
+                image_id = str(uuid.uuid4())
+
+            # 保存新图片
+            current_timestamp = time.time()
+            image_dir = os.path.join(self.IMAGE_DIR, "images")
+            os.makedirs(image_dir, exist_ok=True)
+            filename = f"{image_id}.png"
+            file_path = os.path.join(image_dir, filename)
+
+            # 保存文件
+            with open(file_path, "wb") as f:
+                f.write(image_bytes)
+
+            # 保存到数据库
+            Images.create(
+                image_id=image_id,
+                emoji_hash=image_hash,
+                path=file_path,
+                type="image",
+                timestamp=current_timestamp,
+                vlm_processed=False,
+                count=1,
+            )
+
+            # 启动异步VLM处理
+            asyncio.create_task(self._process_image_with_vlm(image_id, image_base64))
+
+            return image_id, f"[picid:{image_id}]"
+
+        except Exception as e:
+            logger.error(f"处理图片失败: {str(e)}")
+            return "", "[图片]"
+
+    async def _process_image_with_vlm(self, image_id: str, image_base64: str) -> None:
+        """使用VLM处理图片并更新数据库
+
+        Args:
+            image_id: 图片ID
+            image_base64: 图片的base64编码
+        """
+        try:
+            # 计算图片哈希
+            # 确保base64字符串只包含ASCII字符
+            if isinstance(image_base64, str):
+                image_base64 = image_base64.encode("ascii", errors="ignore").decode("ascii")
+            image_bytes = base64.b64decode(image_base64)
+            image_hash = hashlib.md5(image_bytes).hexdigest()
+
+            # 获取当前图片记录
+            image = Images.get(Images.image_id == image_id)
+
+            # 优先检查是否已有其他相同哈希的图片记录包含描述
+            existing_with_description = Images.get_or_none(
+                (Images.emoji_hash == image_hash) & 
+                (Images.description.is_null(False)) & 
+                (Images.description != "")
+            )
+            if existing_with_description and existing_with_description.id != image.id:
+                logger.debug(f"[缓存复用] 从其他相同图片记录复用描述: {existing_with_description.description[:50]}...")
+                image.description = existing_with_description.description
+                image.vlm_processed = True
+                image.save()
+                # 同时保存到ImageDescriptions表作为备用缓存
+                self._save_description_to_db(image_hash, existing_with_description.description, "image")
+                return
+
+            # 检查ImageDescriptions表的缓存描述
+            cached_description = self._get_description_from_db(image_hash, "image")
+            if cached_description:
+                logger.debug(f"[缓存复用] 从ImageDescriptions表复用描述: {cached_description[:50]}...")
+                image.description = cached_description
+                image.vlm_processed = True
+                image.save()
+                return
+
+            # 获取图片格式
+            image_format = Image.open(io.BytesIO(image_bytes)).format.lower()  # type: ignore
+
+            # 构建prompt
+            prompt = global_config.custom_prompt.image_prompt
+
+            # 获取VLM描述
+            logger.info(f"[VLM异步调用] 为图片生成描述 (ID: {image_id}, Hash: {image_hash[:8]}...)")
+            description, _ = await self.vlm.generate_response_for_image(prompt, image_base64, image_format)
+
+            if description is None:
+                logger.warning("VLM未能生成图片描述")
+                description = "无法生成描述"
+
+            # 再次检查缓存，防止并发写入时重复生成
+            cached_description = self._get_description_from_db(image_hash, "image")
+            if cached_description:
+                logger.warning(f"虽然生成了描述，但是找到缓存图片描述: {cached_description}")
+                description = cached_description
+
+            # 更新数据库
+            image.description = description
+            image.vlm_processed = True
+            image.save()
+
+            # 保存描述到ImageDescriptions表作为备用缓存
+            self._save_description_to_db(image_hash, description, "image")
+
+            logger.info(f"[VLM异步完成] 图片描述生成: {description[:50]}...")
+
+        except Exception as e:
+            logger.error(f"VLM处理图片失败: {str(e)}")
+
 
 # 创建全局单例
-image_manager = ImageManager()
+image_manager = None
+
+
+def get_image_manager() -> ImageManager:
+    """获取全局图片管理器单例"""
+    global image_manager
+    if image_manager is None:
+        image_manager = ImageManager()
+    return image_manager
 
 
 def image_path_to_base64(image_path: str) -> str:

@@ -3,18 +3,17 @@ import hashlib
 import time
 import copy
 from typing import Dict, Optional, TYPE_CHECKING
-
-
-from ...common.database.database import db
-from ...common.database.database_model import ChatStreams  # 新增导入
+from rich.traceback import install
 from maim_message import GroupInfo, UserInfo
+
+from src.common.logger import get_logger
+from src.common.database.database import db
+from src.common.database.database_model import ChatStreams  # 新增导入
 
 # 避免循环导入，使用TYPE_CHECKING进行类型提示
 if TYPE_CHECKING:
     from .message import MessageRecv
 
-from src.common.logger_manager import get_logger
-from rich.traceback import install
 
 install(extra_lines=3)
 
@@ -28,10 +27,10 @@ class ChatMessageContext:
     def __init__(self, message: "MessageRecv"):
         self.message = message
 
-    def get_template_name(self) -> str:
+    def get_template_name(self) -> Optional[str]:
         """获取模板名称"""
         if self.message.message_info.template_info and not self.message.message_info.template_info.template_default:
-            return self.message.message_info.template_info.template_name
+            return self.message.message_info.template_info.template_name  # type: ignore
         return None
 
     def get_last_message(self) -> "MessageRecv":
@@ -39,13 +38,24 @@ class ChatMessageContext:
         return self.message
 
     def check_types(self, types: list) -> bool:
+        # sourcery skip: invert-any-all, use-any, use-next
         """检查消息类型"""
-        if not self.message.message_info.format_info.accept_format:
+        if not self.message.message_info.format_info.accept_format:  # type: ignore
             return False
         for t in types:
-            if t not in self.message.message_info.format_info.accept_format:
+            if t not in self.message.message_info.format_info.accept_format:  # type: ignore
                 return False
         return True
+
+    def get_priority_mode(self) -> str:
+        """获取优先级模式"""
+        return self.message.priority_mode
+
+    def get_priority_info(self) -> Optional[dict]:
+        """获取优先级信息"""
+        if hasattr(self.message, "priority_info") and self.message.priority_info:
+            return self.message.priority_info
+        return None
 
 
 class ChatStream:
@@ -57,7 +67,7 @@ class ChatStream:
         platform: str,
         user_info: UserInfo,
         group_info: Optional[GroupInfo] = None,
-        data: dict = None,
+        data: Optional[dict] = None,
     ):
         self.stream_id = stream_id
         self.platform = platform
@@ -66,7 +76,7 @@ class ChatStream:
         self.create_time = data.get("create_time", time.time()) if data else time.time()
         self.last_active_time = data.get("last_active_time", self.create_time) if data else self.create_time
         self.saved = False
-        self.context: ChatMessageContext = None  # 用于存储该聊天的上下文信息
+        self.context: ChatMessageContext = None  # type: ignore # 用于存储该聊天的上下文信息
 
     def to_dict(self) -> dict:
         """转换为字典格式"""
@@ -88,7 +98,7 @@ class ChatStream:
         return cls(
             stream_id=data["stream_id"],
             platform=data["platform"],
-            user_info=user_info,
+            user_info=user_info,  # type: ignore
             group_info=group_info,
             data=data,
         )
@@ -135,7 +145,7 @@ class ChatManager:
         """异步初始化"""
         try:
             await self.load_all_streams()
-            logger.success(f"聊天管理器已启动，已加载 {len(self.streams)} 个聊天流")
+            logger.info(f"聊天管理器已启动，已加载 {len(self.streams)} 个聊天流")
         except Exception as e:
             logger.error(f"聊天管理器启动失败: {str(e)}")
 
@@ -152,23 +162,34 @@ class ChatManager:
     def register_message(self, message: "MessageRecv"):
         """注册消息到聊天流"""
         stream_id = self._generate_stream_id(
-            message.message_info.platform,
+            message.message_info.platform,  # type: ignore
             message.message_info.user_info,
             message.message_info.group_info,
         )
         self.last_messages[stream_id] = message
-        logger.debug(f"注册消息到聊天流: {stream_id}")
+        # logger.debug(f"注册消息到聊天流: {stream_id}")
 
     @staticmethod
-    def _generate_stream_id(platform: str, user_info: UserInfo, group_info: Optional[GroupInfo] = None) -> str:
+    def _generate_stream_id(
+        platform: str, user_info: Optional[UserInfo], group_info: Optional[GroupInfo] = None
+    ) -> str:
         """生成聊天流唯一ID"""
+        if not user_info and not group_info:
+            raise ValueError("用户信息或群组信息必须提供")
+
         if group_info:
             # 组合关键信息
             components = [platform, str(group_info.group_id)]
         else:
-            components = [platform, str(user_info.user_id), "private"]
+            components = [platform, str(user_info.user_id), "private"]  # type: ignore
 
         # 使用MD5生成唯一ID
+        key = "_".join(components)
+        return hashlib.md5(key.encode()).hexdigest()
+
+    def get_stream_id(self, platform: str, id: str, is_group: bool = True) -> str:
+        """获取聊天流ID"""
+        components = [platform, id] if is_group else [platform, id, "private"]
         key = "_".join(components)
         return hashlib.md5(key.encode()).hexdigest()
 
@@ -335,6 +356,7 @@ class ChatManager:
 
     async def load_all_streams(self):
         """从数据库加载所有聊天流"""
+        logger.info("正在从数据库加载所有聊天流")
 
         def _db_load_all_streams_sync():
             loaded_streams_data = []
@@ -377,5 +399,11 @@ class ChatManager:
             logger.error(f"从数据库加载所有聊天流失败 (Peewee): {e}", exc_info=True)
 
 
-# 创建全局单例
-chat_manager = ChatManager()
+chat_manager = None
+
+
+def get_chat_manager():
+    global chat_manager
+    if chat_manager is None:
+        chat_manager = ChatManager()
+    return chat_manager

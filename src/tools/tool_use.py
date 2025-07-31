@@ -1,5 +1,5 @@
 import json
-from src.common.logger_manager import get_logger
+from src.common.logger import get_logger
 from src.tools.tool_can_use import get_all_tool_definitions, get_tool_instance
 
 logger = get_logger("tool_use")
@@ -16,7 +16,8 @@ class ToolUser:
         return get_all_tool_definitions()
 
     @staticmethod
-    async def _execute_tool_call(tool_call):
+    async def execute_tool_call(tool_call):
+        # sourcery skip: use-assigned-variable
         """执行特定的工具调用
 
         Args:

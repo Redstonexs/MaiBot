@@ -1,30 +1,41 @@
 import asyncio
 import hashlib
 import os
+from dotenv import load_dotenv
+
+if os.path.exists(".env"):
+    load_dotenv(".env", override=True)
+    print("成功加载环境变量配置")
+else:
+    print("未找到.env文件，请确保程序所需的环境变量被正确设置")
+    raise FileNotFoundError(".env 文件不存在，请创建并配置所需的环境变量")
 import sys
-from pathlib import Path
 import time
 import platform
 import traceback
-from dotenv import load_dotenv
-from src.common.logger_manager import get_logger
-
-# from src.common.logger import LogConfig, CONFIRM_STYLE_CONFIG
-from src.common.crash_logger import install_crash_handler
-from src.main import MainSystem
+from pathlib import Path
 from rich.traceback import install
 
+# maim_message imports for console input
+
+# 最早期初始化日志系统，确保所有后续模块都使用正确的日志格式
+from src.common.logger import initialize_logging, get_logger, shutdown_logging
+from src.main import MainSystem
 from src.manager.async_task_manager import async_task_manager
+
+initialize_logging()
+
+logger = get_logger("main")
+
 
 install(extra_lines=3)
 
 # 设置工作目录为脚本所在目录
 script_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(script_dir)
-print(f"已设置工作目录为: {script_dir}")
+logger.info(f"已设置工作目录为: {script_dir}")
 
 
-logger = get_logger("main")
 confirm_logger = get_logger("confirm")
 # 获取没有加载env时的环境变量
 env_mask = {key: os.getenv(key) for key in os.environ}
@@ -33,8 +44,6 @@ uvicorn_server = None
 driver = None
 app = None
 loop = None
-
-# shutdown_requested = False  # 新增全局变量
 
 
 async def request_shutdown() -> bool:
@@ -63,16 +72,6 @@ def easter_egg():
     for i, char in enumerate(text):
         rainbow_text += rainbow_colors[i % len(rainbow_colors)] + char
     print(rainbow_text)
-
-
-def load_env():
-    # 直接加载生产环境变量配置
-    if os.path.exists(".env"):
-        load_dotenv(".env", override=True)
-        logger.success("成功加载环境变量配置")
-    else:
-        logger.error("未找到.env文件，请确保文件存在")
-        raise FileNotFoundError("未找到.env文件，请确保文件存在")
 
 
 def scan_provider(env_config: dict):
@@ -113,105 +112,122 @@ async def graceful_shutdown():
         # 停止所有异步任务
         await async_task_manager.stop_and_wait_all_tasks()
 
-        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # 获取所有剩余任务，排除当前任务
+        remaining_tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+
+        if remaining_tasks:
+            logger.info(f"正在取消 {len(remaining_tasks)} 个剩余任务...")
+
+            # 取消所有剩余任务
+            for task in remaining_tasks:
+                if not task.done():
+                    task.cancel()
+
+            # 等待所有任务完成，设置超时
+            try:
+                await asyncio.wait_for(asyncio.gather(*remaining_tasks, return_exceptions=True), timeout=15.0)
+                logger.info("所有剩余任务已成功取消")
+            except asyncio.TimeoutError:
+                logger.warning("等待任务取消超时，强制继续关闭")
+            except Exception as e:
+                logger.error(f"等待任务取消时发生异常: {e}")
+
+        logger.info("麦麦优雅关闭完成")
+
+        # 关闭日志系统，释放文件句柄
+        shutdown_logging()
+
     except Exception as e:
-        logger.error(f"麦麦关闭失败: {e}")
+        logger.error(f"麦麦关闭失败: {e}", exc_info=True)
+
+
+def _calculate_file_hash(file_path: Path, file_type: str) -> str:
+    """计算文件的MD5哈希值"""
+    if not file_path.exists():
+        logger.error(f"{file_type} 文件不存在")
+        raise FileNotFoundError(f"{file_type} 文件不存在")
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    return hashlib.md5(content.encode("utf-8")).hexdigest()
+
+
+def _check_agreement_status(file_hash: str, confirm_file: Path, env_var: str) -> tuple[bool, bool]:
+    """检查协议确认状态
+
+    Returns:
+        tuple[bool, bool]: (已确认, 未更新)
+    """
+    # 检查环境变量确认
+    if file_hash == os.getenv(env_var):
+        return True, False
+
+    # 检查确认文件
+    if confirm_file.exists():
+        with open(confirm_file, "r", encoding="utf-8") as f:
+            confirmed_content = f.read()
+        if file_hash == confirmed_content:
+            return True, False
+
+    return False, True
+
+
+def _prompt_user_confirmation(eula_hash: str, privacy_hash: str) -> None:
+    """提示用户确认协议"""
+    confirm_logger.critical("EULA或隐私条款内容已更新，请在阅读后重新确认，继续运行视为同意更新后的以上两款协议")
+    confirm_logger.critical(
+        f'输入"同意"或"confirmed"或设置环境变量"EULA_AGREE={eula_hash}"和"PRIVACY_AGREE={privacy_hash}"继续运行'
+    )
+
+    while True:
+        user_input = input().strip().lower()
+        if user_input in ["同意", "confirmed"]:
+            return
+        confirm_logger.critical('请输入"同意"或"confirmed"以继续运行')
+
+
+def _save_confirmations(eula_updated: bool, privacy_updated: bool, eula_hash: str, privacy_hash: str) -> None:
+    """保存用户确认结果"""
+    if eula_updated:
+        logger.info(f"更新EULA确认文件{eula_hash}")
+        Path("eula.confirmed").write_text(eula_hash, encoding="utf-8")
+
+    if privacy_updated:
+        logger.info(f"更新隐私条款确认文件{privacy_hash}")
+        Path("privacy.confirmed").write_text(privacy_hash, encoding="utf-8")
 
 
 def check_eula():
-    eula_confirm_file = Path("eula.confirmed")
-    privacy_confirm_file = Path("privacy.confirmed")
-    eula_file = Path("EULA.md")
-    privacy_file = Path("PRIVACY.md")
+    """检查EULA和隐私条款确认状态"""
+    # 计算文件哈希值
+    eula_hash = _calculate_file_hash(Path("EULA.md"), "EULA.md")
+    privacy_hash = _calculate_file_hash(Path("PRIVACY.md"), "PRIVACY.md")
 
-    eula_updated = True
-    privacy_updated = True
+    # 检查确认状态
+    eula_confirmed, eula_updated = _check_agreement_status(eula_hash, Path("eula.confirmed"), "EULA_AGREE")
+    privacy_confirmed, privacy_updated = _check_agreement_status(
+        privacy_hash, Path("privacy.confirmed"), "PRIVACY_AGREE"
+    )
 
-    eula_confirmed = False
-    privacy_confirmed = False
+    # 早期返回：如果都已确认且未更新
+    if eula_confirmed and privacy_confirmed:
+        return
 
-    # 首先计算当前EULA文件的哈希值
-    if eula_file.exists():
-        with open(eula_file, "r", encoding="utf-8") as f:
-            eula_content = f.read()
-        eula_new_hash = hashlib.md5(eula_content.encode("utf-8")).hexdigest()
-    else:
-        logger.error("EULA.md 文件不存在")
-        raise FileNotFoundError("EULA.md 文件不存在")
-
-    # 首先计算当前隐私条款文件的哈希值
-    if privacy_file.exists():
-        with open(privacy_file, "r", encoding="utf-8") as f:
-            privacy_content = f.read()
-        privacy_new_hash = hashlib.md5(privacy_content.encode("utf-8")).hexdigest()
-    else:
-        logger.error("PRIVACY.md 文件不存在")
-        raise FileNotFoundError("PRIVACY.md 文件不存在")
-
-    # 检查EULA确认文件是否存在
-    if eula_confirm_file.exists():
-        with open(eula_confirm_file, "r", encoding="utf-8") as f:
-            confirmed_content = f.read()
-        if eula_new_hash == confirmed_content:
-            eula_confirmed = True
-            eula_updated = False
-    if eula_new_hash == os.getenv("EULA_AGREE"):
-        eula_confirmed = True
-        eula_updated = False
-
-    # 检查隐私条款确认文件是否存在
-    if privacy_confirm_file.exists():
-        with open(privacy_confirm_file, "r", encoding="utf-8") as f:
-            confirmed_content = f.read()
-        if privacy_new_hash == confirmed_content:
-            privacy_confirmed = True
-            privacy_updated = False
-    if privacy_new_hash == os.getenv("PRIVACY_AGREE"):
-        privacy_confirmed = True
-        privacy_updated = False
-
-    # 如果EULA或隐私条款有更新，提示用户重新确认
+    # 如果有更新，需要重新确认
     if eula_updated or privacy_updated:
-        confirm_logger.critical("EULA或隐私条款内容已更新，请在阅读后重新确认，继续运行视为同意更新后的以上两款协议")
-        confirm_logger.critical(
-            f'输入"同意"或"confirmed"或设置环境变量"EULA_AGREE={eula_new_hash}"和"PRIVACY_AGREE={privacy_new_hash}"继续运行'
-        )
-        while True:
-            user_input = input().strip().lower()
-            if user_input in ["同意", "confirmed"]:
-                # print("确认成功，继续运行")
-                # print(f"确认成功，继续运行{eula_updated} {privacy_updated}")
-                if eula_updated:
-                    logger.info(f"更新EULA确认文件{eula_new_hash}")
-                    eula_confirm_file.write_text(eula_new_hash, encoding="utf-8")
-                if privacy_updated:
-                    logger.info(f"更新隐私条款确认文件{privacy_new_hash}")
-                    privacy_confirm_file.write_text(privacy_new_hash, encoding="utf-8")
-                break
-            else:
-                confirm_logger.critical('请输入"同意"或"confirmed"以继续运行')
-        return
-    elif eula_confirmed and privacy_confirmed:
-        return
+        _prompt_user_confirmation(eula_hash, privacy_hash)
+        _save_confirmations(eula_updated, privacy_updated, eula_hash, privacy_hash)
 
 
 def raw_main():
     # 利用 TZ 环境变量设定程序工作的时区
     if platform.system().lower() != "windows":
-        time.tzset()
-
-    # 安装崩溃日志处理器
-    install_crash_handler()
+        time.tzset()  # type: ignore
 
     check_eula()
-    print("检查EULA和隐私条款完成")
+    logger.info("检查EULA和隐私条款完成")
 
     easter_egg()
-
-    load_env()
 
     env_config = {key: os.getenv(key) for key in os.environ}
     scan_provider(env_config)
@@ -233,9 +249,13 @@ if __name__ == "__main__":
         try:
             # 执行初始化和任务调度
             loop.run_until_complete(main_system.initialize())
-            loop.run_until_complete(main_system.schedule_tasks())
+            # Schedule tasks returns a future that runs forever.
+            # We can run console_input_loop concurrently.
+            main_tasks = loop.create_task(main_system.schedule_tasks())
+            loop.run_until_complete(main_tasks)
+
         except KeyboardInterrupt:
-            # loop.run_until_complete(global_api.stop())
+            # loop.run_until_complete(get_global_api().stop())
             logger.warning("收到中断信号，正在优雅关闭...")
             if loop and not loop.is_closed():
                 try:
@@ -243,16 +263,6 @@ if __name__ == "__main__":
                 except Exception as ge:  # 捕捉优雅关闭时可能发生的错误
                     logger.error(f"优雅关闭时发生错误: {ge}")
         # 新增：检测外部请求关闭
-
-        # except Exception as e: # 将主异常捕获移到外层 try...except
-        #     logger.error(f"事件循环内发生错误: {str(e)} {str(traceback.format_exc())}")
-        #     exit_code = 1
-        # finally: # finally 块移到最外层，确保 loop 关闭和暂停总是执行
-        #     if loop and not loop.is_closed():
-        #         loop.close()
-        #     # 在这里添加 input() 来暂停
-        #     input("按 Enter 键退出...") # <--- 添加这行
-        #     sys.exit(exit_code) # <--- 使用记录的退出码
 
     except Exception as e:
         logger.error(f"主程序发生异常: {str(e)} {str(traceback.format_exc())}")
@@ -262,6 +272,13 @@ if __name__ == "__main__":
         if "loop" in locals() and loop and not loop.is_closed():
             loop.close()
             logger.info("事件循环已关闭")
+
+        # 关闭日志系统，释放文件句柄
+        try:
+            shutdown_logging()
+        except Exception as e:
+            print(f"关闭日志系统时出错: {e}")
+
         # 在程序退出前暂停，让你有机会看到输出
         # input("按 Enter 键退出...")  # <--- 添加这行
         sys.exit(exit_code)  # <--- 使用记录的退出码

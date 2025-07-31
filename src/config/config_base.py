@@ -43,7 +43,7 @@ class ConfigBase:
             field_type = f.type
 
             try:
-                init_args[field_name] = cls._convert_field(value, field_type)
+                init_args[field_name] = cls._convert_field(value, field_type)  # type: ignore
             except TypeError as e:
                 raise TypeError(f"Field '{field_name}' has a type error: {e}") from e
             except Exception as e:
@@ -78,6 +78,13 @@ class ConfigBase:
                 raise TypeError(f"Expected an list for {field_type.__name__}, got {type(value).__name__}")
 
             if field_origin_type is list:
+                # 如果列表元素类型是ConfigBase的子类，则对每个元素调用from_dict
+                if (
+                    field_type_args
+                    and isinstance(field_type_args[0], type)
+                    and issubclass(field_type_args[0], ConfigBase)
+                ):
+                    return [field_type_args[0].from_dict(item) for item in value]
                 return [cls._convert_field(item, field_type_args[0]) for item in value]
             elif field_origin_type is set:
                 return {cls._convert_field(item, field_type_args[0]) for item in value}
@@ -87,7 +94,7 @@ class ConfigBase:
                     raise TypeError(
                         f"Expected {len(field_type_args)} items for {field_type.__name__}, got {len(value)}"
                     )
-                return tuple(cls._convert_field(item, arg) for item, arg in zip(value, field_type_args))
+                return tuple(cls._convert_field(item, arg) for item, arg in zip(value, field_type_args, strict=False))
 
         if field_origin_type is dict:
             # 检查提供的value是否为dict

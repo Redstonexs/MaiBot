@@ -5,12 +5,13 @@ from typing import Tuple, Union
 
 import aiohttp
 import requests
-from src.common.logger import get_module_logger
+from src.common.logger import get_logger
+from src.common.tcp_connector import get_tcp_connector
 from rich.traceback import install
 
 install(extra_lines=3)
 
-logger = get_module_logger("offline_llm")
+logger = get_logger("offline_llm")
 
 
 class LLMRequestOff:
@@ -38,7 +39,7 @@ class LLMRequestOff:
         }
 
         # 发送请求到完整的 chat/completions 端点
-        api_url = f"{self.base_url.rstrip('/')}/chat/completions"
+        api_url = f"{self.base_url.rstrip('/')}/chat/completions"  # type: ignore
         logger.info(f"Request URL: {api_url}")  # 记录请求的 URL
 
         max_retries = 3
@@ -88,13 +89,13 @@ class LLMRequestOff:
         }
 
         # 发送请求到完整的 chat/completions 端点
-        api_url = f"{self.base_url.rstrip('/')}/chat/completions"
+        api_url = f"{self.base_url.rstrip('/')}/chat/completions"  # type: ignore
         logger.info(f"Request URL: {api_url}")  # 记录请求的 URL
 
         max_retries = 3
         base_wait_time = 15
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(connector=await get_tcp_connector()) as session:
             for retry in range(max_retries):
                 try:
                     async with session.post(api_url, headers=headers, json=data) as response:
