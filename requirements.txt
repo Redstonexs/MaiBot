@@ -15,6 +15,7 @@ matplotlib
 networkx
 numpy
 openai
+google-genai
 pandas
 peewee
 pyarrow
@@ -46,3 +47,4 @@ reportportal-client
 scikit-learn
 seaborn
 structlog
+google.genai
